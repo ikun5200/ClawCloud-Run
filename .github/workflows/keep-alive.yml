@@ -32,11 +32,15 @@ jobs:
 
       - name: 运行自动登录
         env:
+          NOTIFY_PROVIDER: ${{ vars.NOTIFY_PROVIDER != '' && vars.NOTIFY_PROVIDER || secrets.NOTIFY_PROVIDER }}
           GH_USERNAME: ${{ secrets.GH_USERNAME }}
           GH_PASSWORD: ${{ secrets.GH_PASSWORD }}
           GH_SESSION: ${{ secrets.GH_SESSION }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
           REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
         run: python scripts/auto_login.py
         
