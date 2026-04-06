@@ -3,10 +3,11 @@ ClawCloud 自动登录脚本
 - 自动检测区域跳转（如 ap-southeast-1.console.claw.cloud）
 - 等待设备验证批准（30秒）
 - 每次登录后自动更新 Cookie
-- Telegram 通知
+- 支持 Telegram / Discord 通知
 """
 
 import base64
+import json
 import os
 import random
 import re
@@ -27,16 +28,71 @@ LOGIN_ENTRY_URL = "https://eu-central-1.run.claw.cloud/login"
 SIGNIN_URL = f"{LOGIN_ENTRY_URL}/signin"
 DEVICE_VERIFY_WAIT = 30  # Mobile验证 默认等 30 秒
 TWO_FACTOR_WAIT = int(os.environ.get("TWO_FACTOR_WAIT", "120"))  # 2FA验证 默认等 120 秒
+NOTIFY_PROVIDER = os.environ.get("NOTIFY_PROVIDER", "tg").strip().lower()
 
 
-class Telegram:
-    """Telegram 通知"""
-    
+def normalize_notify_provider(value):
+    aliases = {
+        "": "tg",
+        "tg": "tg",
+        "telegram": "tg",
+        "discord": "discord",
+    }
+    normalized = (value or "").strip().lower()
+    return aliases.get(normalized, normalized)
+
+
+class BaseNotifier:
+    """通知接口"""
+
+    provider = "none"
+    display_name = "通知"
+    command_target = "通知通道"
+
     def __init__(self):
+        self.ok = False
+
+    def send(self, msg):
+        return None
+
+    def photo(self, path, caption=""):
+        return None
+
+    def flush_updates(self):
+        return None
+
+    def wait_code(self, timeout=120):
+        return None
+
+
+class NullNotifier(BaseNotifier):
+    """空通知器"""
+
+    def __init__(self, provider="none", reason=""):
+        super().__init__()
+        self.provider = provider or "none"
+        self.display_name = self.provider
+        if reason:
+            print(reason)
+
+
+class TelegramNotifier(BaseNotifier):
+    """Telegram 通知"""
+
+    provider = "tg"
+    display_name = "Telegram"
+    command_target = "Telegram 聊天"
+
+    def __init__(self):
+        super().__init__()
         self.token = os.environ.get('TG_BOT_TOKEN')
         self.chat_id = os.environ.get('TG_CHAT_ID')
         self.ok = bool(self.token and self.chat_id)
-    
+        if self.ok:
+            print("✅ Telegram 通知已启用")
+        else:
+            print("⚠️ Telegram 通知未启用（需要 TG_BOT_TOKEN 和 TG_CHAT_ID）")
+
     def send(self, msg):
         if not self.ok:
             return
@@ -46,9 +102,9 @@ class Telegram:
                 data={"chat_id": self.chat_id, "text": msg, "parse_mode": "HTML"},
                 timeout=30
             )
-        except:
+        except Exception:
             pass
-    
+
     def photo(self, path, caption=""):
         if not self.ok or not os.path.exists(path):
             return
@@ -60,9 +116,9 @@ class Telegram:
                     files={"photo": f},
                     timeout=60
                 )
-        except:
+        except Exception:
             pass
-    
+
     def flush_updates(self):
         """刷新 offset 到最新，避免读到旧消息"""
         if not self.ok:
@@ -76,23 +132,22 @@ class Telegram:
             data = r.json()
             if data.get("ok") and data.get("result"):
                 return data["result"][-1]["update_id"] + 1
-        except:
+        except Exception:
             pass
         return 0
-    
+
     def wait_code(self, timeout=120):
         """
-        等待你在 TG 里发 /code 123456
+        等待你在 Telegram 里发 /code 123456
         只接受来自 TG_CHAT_ID 的消息
         """
         if not self.ok:
             return None
-        
-        # 先刷新 offset，避免读到旧的 /code
+
         offset = self.flush_updates()
         deadline = time.time() + timeout
-        pattern = re.compile(r"^/code\s+(\d{6,8})$")  # 6位TOTP 或 8位恢复码也行
-        
+        pattern = re.compile(r"^/code\s+(\d{6,8})$")
+
         while time.time() < deadline:
             try:
                 r = requests.get(
@@ -104,25 +159,168 @@ class Telegram:
                 if not data.get("ok"):
                     time.sleep(2)
                     continue
-                
+
                 for upd in data.get("result", []):
                     offset = upd["update_id"] + 1
                     msg = upd.get("message") or {}
                     chat = msg.get("chat") or {}
                     if str(chat.get("id")) != str(self.chat_id):
                         continue
-                    
+
                     text = (msg.get("text") or "").strip()
-                    m = pattern.match(text)
-                    if m:
-                        return m.group(1)
-            
+                    matched = pattern.match(text)
+                    if matched:
+                        return matched.group(1)
+
             except Exception:
                 pass
-            
+
             time.sleep(2)
-        
+
         return None
+
+
+class DiscordNotifier(BaseNotifier):
+    """Discord 通知"""
+
+    provider = "discord"
+    display_name = "Discord"
+    command_target = "Discord 频道"
+
+    def __init__(self):
+        super().__init__()
+        self.token = os.environ.get('DISCORD_BOT_TOKEN')
+        self.channel_id = os.environ.get('DISCORD_CHANNEL_ID')
+        self.user_id = os.environ.get('DISCORD_USER_ID', '').strip()
+        self.api_base = "https://discord.com/api/v10"
+        self.ok = bool(self.token and self.channel_id)
+        if self.ok:
+            print("✅ Discord 通知已启用")
+        else:
+            print("⚠️ Discord 通知未启用（需要 DISCORD_BOT_TOKEN 和 DISCORD_CHANNEL_ID）")
+
+    def _headers(self, json_request=False):
+        headers = {"Authorization": f"Bot {self.token}"}
+        if json_request:
+            headers["Content-Type"] = "application/json"
+        return headers
+
+    def _render_message(self, msg):
+        rendered = (
+            msg.replace("<b>", "**")
+            .replace("</b>", "**")
+            .replace("<code>", "`")
+            .replace("</code>", "`")
+            .replace("<tg-spoiler>", "||")
+            .replace("</tg-spoiler>", "||")
+        )
+        return re.sub(r"</?[^>]+>", "", rendered)
+
+    def send(self, msg):
+        if not self.ok:
+            return
+        try:
+            requests.post(
+                f"{self.api_base}/channels/{self.channel_id}/messages",
+                headers=self._headers(json_request=True),
+                json={"content": self._render_message(msg)},
+                timeout=30
+            )
+        except Exception:
+            pass
+
+    def photo(self, path, caption=""):
+        if not self.ok or not os.path.exists(path):
+            return
+        try:
+            payload = {"content": self._render_message(caption[:1800])} if caption else {}
+            with open(path, 'rb') as f:
+                requests.post(
+                    f"{self.api_base}/channels/{self.channel_id}/messages",
+                    headers=self._headers(),
+                    data={"payload_json": json.dumps(payload)},
+                    files={"files[0]": (os.path.basename(path), f)},
+                    timeout=60
+                )
+        except Exception:
+            pass
+
+    def flush_updates(self):
+        """记录当前频道最后一条消息，避免读到旧的 /code"""
+        if not self.ok:
+            return None
+        try:
+            r = requests.get(
+                f"{self.api_base}/channels/{self.channel_id}/messages",
+                headers=self._headers(),
+                params={"limit": 1},
+                timeout=10
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if data:
+                    return data[0]["id"]
+        except Exception:
+            pass
+        return None
+
+    def wait_code(self, timeout=120):
+        """
+        等待你在 Discord 频道里发 /code 123456
+        可选通过 DISCORD_USER_ID 限制发送者
+        """
+        if not self.ok:
+            return None
+
+        after = self.flush_updates()
+        deadline = time.time() + timeout
+        pattern = re.compile(r"^/code\s+(\d{6,8})$")
+
+        while time.time() < deadline:
+            try:
+                params = {"limit": 50}
+                if after:
+                    params["after"] = after
+
+                r = requests.get(
+                    f"{self.api_base}/channels/{self.channel_id}/messages",
+                    headers=self._headers(),
+                    params=params,
+                    timeout=30
+                )
+                if r.status_code != 200:
+                    time.sleep(2)
+                    continue
+
+                messages = sorted(r.json(), key=lambda item: int(item["id"]))
+                for message in messages:
+                    after = message["id"]
+                    author = message.get("author") or {}
+                    if author.get("bot"):
+                        continue
+                    if self.user_id and str(author.get("id")) != str(self.user_id):
+                        continue
+
+                    text = (message.get("content") or "").strip()
+                    matched = pattern.match(text)
+                    if matched:
+                        return matched.group(1)
+
+            except Exception:
+                pass
+
+            time.sleep(2)
+
+        return None
+
+
+def build_notifier():
+    provider = normalize_notify_provider(NOTIFY_PROVIDER)
+    if provider == "tg":
+        return TelegramNotifier()
+    if provider == "discord":
+        return DiscordNotifier()
+    return NullNotifier(provider=provider, reason=f"⚠️ 未知通知类型: {provider}（支持 tg / discord）")
 
 
 class SecretUpdater:
@@ -180,7 +378,7 @@ class AutoLogin:
         self.username = os.environ.get('GH_USERNAME')
         self.password = os.environ.get('GH_PASSWORD')
         self.gh_session = os.environ.get('GH_SESSION', '').strip()
-        self.tg = Telegram()
+        self.notifier = build_notifier()
         self.secret = SecretUpdater()
         self.shots = []
         self.logs = []
@@ -290,29 +488,28 @@ class AutoLogin:
         # 自动更新 Secret
         if self.secret.update('GH_SESSION', value):
             self.log("已自动更新 GH_SESSION", "SUCCESS")
-            self.tg.send("🔑 <b>Cookie 已自动更新</b>\n\nGH_SESSION 已保存")
+            self.notifier.send("🔑 <b>Cookie 已自动更新</b>\n\nGH_SESSION 已保存")
         else:
-            # 通过 Telegram 发送
-            self.tg.send(f"""🔑 <b>新 Cookie</b>
+            self.notifier.send(f"""🔑 <b>新 Cookie</b>
 
 请更新 Secret <b>GH_SESSION</b> (点击查看):
 <tg-spoiler>{value}</tg-spoiler>
 """)
-            self.log("已通过 Telegram 发送 Cookie", "SUCCESS")
+            self.log(f"已通过{self.notifier.display_name}发送 Cookie", "SUCCESS")
     
     def wait_device(self, page):
         """等待设备验证"""
         self.log(f"需要设备验证，等待 {DEVICE_VERIFY_WAIT} 秒...", "WARN")
         self.shot(page, "设备验证")
         
-        self.tg.send(f"""⚠️ <b>需要设备验证</b>
+        self.notifier.send(f"""⚠️ <b>需要设备验证</b>
 
 请在 {DEVICE_VERIFY_WAIT} 秒内批准：
 1️⃣ 检查邮箱点击链接
 2️⃣ 或在 GitHub App 批准""")
         
         if self.shots:
-            self.tg.photo(self.shots[-1], "设备验证页面")
+            self.notifier.photo(self.shots[-1], "设备验证页面")
         
         for i in range(DEVICE_VERIFY_WAIT):
             time.sleep(1)
@@ -321,7 +518,7 @@ class AutoLogin:
                 url = page.url
                 if 'verified-device' not in url and 'device-verification' not in url:
                     self.log("设备验证通过！", "SUCCESS")
-                    self.tg.send("✅ <b>设备验证通过</b>")
+                    self.notifier.send("✅ <b>设备验证通过</b>")
                     return True
                 try:
                     page.reload(timeout=10000)
@@ -333,21 +530,21 @@ class AutoLogin:
             return True
         
         self.log("设备验证超时", "ERROR")
-        self.tg.send("❌ <b>设备验证超时</b>")
+        self.notifier.send("❌ <b>设备验证超时</b>")
         return False
     
     def wait_two_factor_mobile(self, page):
-        """等待 GitHub Mobile 两步验证批准，并把数字截图提前发到电报"""
+        """等待 GitHub Mobile 两步验证批准，并把数字截图提前发到通知渠道"""
         self.log(f"需要两步验证（GitHub Mobile），等待 {TWO_FACTOR_WAIT} 秒...", "WARN")
         
         # 先截图并立刻发出去（让你看到数字）
         shot = self.shot(page, "两步验证_mobile")
-        self.tg.send(f"""⚠️ <b>需要两步验证（GitHub Mobile）</b>
+        self.notifier.send(f"""⚠️ <b>需要两步验证（GitHub Mobile）</b>
 
 请打开手机 GitHub App 批准本次登录（会让你确认一个数字）。
 等待时间：{TWO_FACTOR_WAIT} 秒""")
         if shot:
-            self.tg.photo(shot, "两步验证页面（数字在图里）")
+            self.notifier.photo(shot, "两步验证页面（数字在图里）")
         
         # 不要频繁 reload，避免把流程刷回登录页
         for i in range(TWO_FACTOR_WAIT):
@@ -358,7 +555,7 @@ class AutoLogin:
             # 如果离开 two-factor 流程页面，认为通过
             if "github.com/sessions/two-factor/" not in url:
                 self.log("两步验证通过！", "SUCCESS")
-                self.tg.send("✅ <b>两步验证通过</b>")
+                self.notifier.send("✅ <b>两步验证通过</b>")
                 return True
             
             # 如果被刷回登录页，说明这次流程断了（不要硬等）
@@ -371,7 +568,7 @@ class AutoLogin:
                 self.log(f"  等待... ({i}/{TWO_FACTOR_WAIT}秒)")
                 shot = self.shot(page, f"两步验证_{i}s")
                 if shot:
-                    self.tg.photo(shot, f"两步验证页面（第{i}秒）")
+                    self.notifier.photo(shot, f"两步验证页面（第{i}秒）")
             
             # 只在 30 秒、60 秒... 做一次轻刷新（可选，频率很低）
             if i % 30 == 0 and i != 0:
@@ -382,13 +579,17 @@ class AutoLogin:
                     pass
         
         self.log("两步验证超时", "ERROR")
-        self.tg.send("❌ <b>两步验证超时</b>")
+        self.notifier.send("❌ <b>两步验证超时</b>")
         return False
     
     def handle_2fa_code_input(self, page):
-        """处理 TOTP 验证码输入（通过 Telegram 发送 /code 123456）"""
+        """处理 TOTP 验证码输入（通过通知渠道发送 /code 123456）"""
         self.log("需要输入验证码", "WARN")
         shot = self.shot(page, "两步验证_code")
+
+        if not self.notifier.ok:
+            self.log("通知渠道未配置，无法接收验证码", "ERROR")
+            return False
 
         # 如果是 Security Key (webauthn) 页面，尝试切换到 Authenticator App
         if 'two-factor/webauthn' in page.url:
@@ -438,26 +639,26 @@ class AutoLogin:
             pass
 
         # 发送提示并等待验证码
-        self.tg.send(f"""🔐 <b>需要验证码登录</b>
+        self.notifier.send(f"""🔐 <b>需要验证码登录</b>
 
-用户{self.username}正在登录，请在 Telegram 里发送：
+用户{self.username}正在登录，请在{self.notifier.command_target}发送：
 <code>/code 你的6位验证码</code>
 
 等待时间：{TWO_FACTOR_WAIT} 秒""")
         if shot:
-            self.tg.photo(shot, "两步验证页面")
+            self.notifier.photo(shot, "两步验证页面")
 
         self.log(f"等待验证码（{TWO_FACTOR_WAIT}秒）...", "WARN")
-        code = self.tg.wait_code(timeout=TWO_FACTOR_WAIT)
+        code = self.notifier.wait_code(timeout=TWO_FACTOR_WAIT)
 
         if not code:
             self.log("等待验证码超时", "ERROR")
-            self.tg.send("❌ <b>等待验证码超时</b>")
+            self.notifier.send("❌ <b>等待验证码超时</b>")
             return False
 
         # 不打印验证码明文，只提示收到
         self.log("收到验证码，正在填入...", "SUCCESS")
-        self.tg.send("✅ 收到验证码，正在填入...")
+        self.notifier.send("✅ 收到验证码，正在填入...")
 
         # 常见 OTP 输入框 selector（优先级排序）
         selectors = [
@@ -509,17 +710,17 @@ class AutoLogin:
                     # 检查是否通过
                     if "github.com/sessions/two-factor/" not in page.url:
                         self.log("验证码验证通过！", "SUCCESS")
-                        self.tg.send("✅ <b>验证码验证通过</b>")
+                        self.notifier.send("✅ <b>验证码验证通过</b>")
                         return True
                     else:
                         self.log("验证码可能错误", "ERROR")
-                        self.tg.send("❌ <b>验证码可能错误，请检查后重试</b>")
+                        self.notifier.send("❌ <b>验证码可能错误，请检查后重试</b>")
                         return False
             except:
                 pass
 
         self.log("没找到验证码输入框", "ERROR")
-        self.tg.send("❌ <b>没找到验证码输入框</b>")
+        self.notifier.send("❌ <b>没找到验证码输入框</b>")
         return False
     
     def login_github(self, page, context):
@@ -585,7 +786,7 @@ class AutoLogin:
                     pass
             
             else:
-                # 其它两步验证方式（TOTP/恢复码等），尝试通过 Telegram 输入验证码
+                # 其它两步验证方式（TOTP/恢复码等），尝试通过通知渠道输入验证码
                 if not self.handle_2fa_code_input(page):
                     return False
                 # 通过后等页面稳定
@@ -675,7 +876,7 @@ class AutoLogin:
         self.shot(page, "完成")
     
     def notify(self, ok, err=""):
-        if not self.tg.ok:
+        if not self.notifier.ok:
             return
         
         region_info = f"\n<b>区域:</b> {self.detected_region or '默认'}" if self.detected_region else ""
@@ -691,17 +892,17 @@ class AutoLogin:
         
         msg += "\n\n<b>日志:</b>\n" + "\n".join(self.logs[-6:])
         
-        self.tg.send(msg)
+        self.notifier.send(msg)
         
         if self.shots:
             if not ok:
                 for s in self.shots[-3:]:
-                    self.tg.photo(s, s)
+                    self.notifier.photo(s, s)
             else:
                 # for s in self.shots[-3:]:
-                #     self.tg.photo(s, s)
+                #     self.notifier.photo(s, s)
                 if self.shots:
-                   self.tg.photo(self.shots[-1], "完成")
+                    self.notifier.photo(self.shots[-1], "完成")
     
     def run(self):
         print("\n" + "="*50)
@@ -712,6 +913,7 @@ class AutoLogin:
         self.log(f"Session: {'有' if self.gh_session else '无'}")
         self.log(f"密码: {'有' if self.password else '无'}")
         self.log(f"登录入口: {LOGIN_ENTRY_URL}")
+        self.log(f"通知渠道: {self.notifier.display_name} ({'已启用' if self.notifier.ok else '未启用'})")
         
         if not self.username or not self.password:
             self.log("缺少凭据", "ERROR")
