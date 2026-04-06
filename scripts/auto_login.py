@@ -93,31 +93,42 @@ class TelegramNotifier(BaseNotifier):
         else:
             print("⚠️ Telegram 通知未启用（需要 TG_BOT_TOKEN 和 TG_CHAT_ID）")
 
+    def _log_failed_response(self, action, response):
+        try:
+            body = response.text[:500]
+        except Exception:
+            body = "<unavailable>"
+        print(f"❌ Telegram {action}失败: HTTP {response.status_code} {body}")
+
     def send(self, msg):
         if not self.ok:
             return
         try:
-            requests.post(
+            response = requests.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
                 data={"chat_id": self.chat_id, "text": msg, "parse_mode": "HTML"},
                 timeout=30
             )
-        except Exception:
-            pass
+            if response.status_code >= 400:
+                self._log_failed_response("发送消息", response)
+        except Exception as e:
+            print(f"❌ Telegram 发送消息异常: {type(e).__name__}: {e}")
 
     def photo(self, path, caption=""):
         if not self.ok or not os.path.exists(path):
             return
         try:
             with open(path, 'rb') as f:
-                requests.post(
+                response = requests.post(
                     f"https://api.telegram.org/bot{self.token}/sendPhoto",
                     data={"chat_id": self.chat_id, "caption": caption[:1024]},
                     files={"photo": f},
                     timeout=60
                 )
-        except Exception:
-            pass
+                if response.status_code >= 400:
+                    self._log_failed_response("发送图片", response)
+        except Exception as e:
+            print(f"❌ Telegram 发送图片异常: {type(e).__name__}: {e}")
 
     def flush_updates(self):
         """刷新 offset 到最新，避免读到旧消息"""
@@ -199,6 +210,13 @@ class DiscordNotifier(BaseNotifier):
         else:
             print("⚠️ Discord 通知未启用（需要 DISCORD_BOT_TOKEN 和 DISCORD_CHANNEL_ID）")
 
+    def _log_failed_response(self, action, response):
+        try:
+            body = response.text[:500]
+        except Exception:
+            body = "<unavailable>"
+        print(f"❌ Discord {action}失败: HTTP {response.status_code} {body}")
+
     def _headers(self, json_request=False):
         headers = {"Authorization": f"Bot {self.token}"}
         if json_request:
@@ -220,14 +238,16 @@ class DiscordNotifier(BaseNotifier):
         if not self.ok:
             return
         try:
-            requests.post(
+            response = requests.post(
                 f"{self.api_base}/channels/{self.channel_id}/messages",
                 headers=self._headers(json_request=True),
                 json={"content": self._render_message(msg)},
                 timeout=30
             )
-        except Exception:
-            pass
+            if response.status_code >= 400:
+                self._log_failed_response("发送消息", response)
+        except Exception as e:
+            print(f"❌ Discord 发送消息异常: {type(e).__name__}: {e}")
 
     def photo(self, path, caption=""):
         if not self.ok or not os.path.exists(path):
@@ -235,15 +255,17 @@ class DiscordNotifier(BaseNotifier):
         try:
             payload = {"content": self._render_message(caption[:1800])} if caption else {}
             with open(path, 'rb') as f:
-                requests.post(
+                response = requests.post(
                     f"{self.api_base}/channels/{self.channel_id}/messages",
                     headers=self._headers(),
                     data={"payload_json": json.dumps(payload)},
                     files={"files[0]": (os.path.basename(path), f)},
                     timeout=60
                 )
-        except Exception:
-            pass
+                if response.status_code >= 400:
+                    self._log_failed_response("发送图片", response)
+        except Exception as e:
+            print(f"❌ Discord 发送图片异常: {type(e).__name__}: {e}")
 
     def flush_updates(self):
         """记录当前频道最后一条消息，避免读到旧的 /code"""
