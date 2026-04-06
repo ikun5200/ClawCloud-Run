@@ -61,6 +61,9 @@ class BaseNotifier:
     def ping(self, username=""):
         return None
 
+    def describe_target(self):
+        return None
+
     def flush_updates(self):
         return None
 
@@ -88,8 +91,8 @@ class TelegramNotifier(BaseNotifier):
 
     def __init__(self):
         super().__init__()
-        self.token = os.environ.get('TG_BOT_TOKEN')
-        self.chat_id = os.environ.get('TG_CHAT_ID')
+        self.token = os.environ.get('TG_BOT_TOKEN', '').strip()
+        self.chat_id = os.environ.get('TG_CHAT_ID', '').strip()
         self.ok = bool(self.token and self.chat_id)
         if self.ok:
             print("✅ Telegram 通知已启用")
@@ -212,8 +215,8 @@ class DiscordNotifier(BaseNotifier):
 
     def __init__(self):
         super().__init__()
-        self.token = os.environ.get('DISCORD_BOT_TOKEN')
-        self.channel_id = os.environ.get('DISCORD_CHANNEL_ID')
+        self.token = os.environ.get('DISCORD_BOT_TOKEN', '').strip()
+        self.channel_id = os.environ.get('DISCORD_CHANNEL_ID', '').strip()
         self.user_id = os.environ.get('DISCORD_USER_ID', '').strip()
         self.api_base = "https://discord.com/api/v10"
         self.ok = bool(self.token and self.channel_id)
@@ -245,6 +248,30 @@ class DiscordNotifier(BaseNotifier):
             .replace("</tg-spoiler>", "||")
         )
         return re.sub(r"</?[^>]+>", "", rendered)
+
+    def describe_target(self):
+        if not self.ok:
+            return
+        try:
+            response = requests.get(
+                f"{self.api_base}/channels/{self.channel_id}",
+                headers=self._headers(),
+                timeout=30
+            )
+            if response.status_code >= 400:
+                self._log_failed_response("读取频道", response)
+                return
+
+            data = response.json()
+            channel_name = data.get("name") or "<unnamed>"
+            channel_type = data.get("type")
+            guild_id = data.get("guild_id") or "<no-guild>"
+            print(
+                f"✅ Discord 频道可访问: name={channel_name} "
+                f"type={channel_type} guild_id={guild_id}"
+            )
+        except Exception as e:
+            print(f"❌ Discord 读取频道异常: {type(e).__name__}: {e}")
 
     def send(self, msg):
         if not self.ok:
@@ -957,6 +984,7 @@ class AutoLogin:
         self.log(f"密码: {'有' if self.password else '无'}")
         self.log(f"登录入口: {LOGIN_ENTRY_URL}")
         self.log(f"通知渠道: {self.notifier.display_name} ({'已启用' if self.notifier.ok else '未启用'})")
+        self.notifier.describe_target()
         self.notifier.ping(self.username)
         
         if not self.username or not self.password:
